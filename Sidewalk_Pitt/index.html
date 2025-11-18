@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Walking Directions w/ No Steps & No Steep Slopes</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <!-- Mapbox GL JS -->
+  <link
+    href="https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.css"
+    rel="stylesheet"
+  />
+  <!-- Mapbox Directions plugin -->
+  <link
+    href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.3.1/mapbox-gl-directions.css"
+    rel="stylesheet"
+  />
+  <style>
+    body, html { margin:0; padding:0; height:100%; }
+    #map { width:100%; height:100%; }
+    #controls {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: white;
+        padding: 10px;
+        border-radius: 4px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="controls">
+        <label>
+            <input type="checkbox" id="avoidStairs" checked>
+            Avoid Stairs
+        </label>
+        <br>
+        <label>
+            <input type="checkbox" id="avoidSlopes" checked>
+            Avoid Steep Slopes
+        </label>
+        <br>
+        <label>
+            Max Slope: <input type="number" id="maxSlope" value="8" min="1" max="20">%
+        </label>
+    </div>
+
+  <!-- Mapbox GL JS -->
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.js"></script>
+  <!-- Directions plugin -->
+  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.3.1/mapbox-gl-directions.js"></script>
+  <!-- Turf for distance calculations -->
+  <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+  <script>
+  // 1. Set your Mapbox access token
+  mapboxgl.accessToken = 'pk.eyJ1IjoiY2phcm9zNjEiLCJhIjoiY2xwdHF3eGFiMGV3eDJpcHh3NW54YzVnZyJ9.8m6Pre4QeD23nKnIHtouCw';
+
+  // 2. Initialize the map with your custom sidewalk style
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/cjaros61/cmc0tuau3003a01s9ap4ldsoi',
+    center: [-79.9959, 40.4406],  // Pittsburgh downtown coordinates
+    zoom: 13  // Adjusted zoom level for better city view
+  });
+
+  // 3. Add the raster DEM source & enable terrain (for slope queries)
+  map.on('load', () => {
+    map.addSource('mapbox-dem', {
+      'type': 'raster-dem',
+      'url': 'mapbox://mapbox.mapbox-terrain-dem-v1',
+      'tileSize': 512
+    });
+    map.setTerrain({ source: 'mapbox-dem', exaggeration: 1 });
+  });
+
+  // 4. Create the Directions control
+  const directions = new MapboxDirections({
+    accessToken: mapboxgl.accessToken,
+    profile: 'mapbox/walking',
+    unit: 'metric'
+});
+
+  map.addControl(directions, 'top-left');
+
+  // 5. Helper: check if a route uses any stairs
+  function routeHasStairs(route) {
+    return route.legs.some(leg =>
+      leg.steps.some(step =>
+        step.intersections.some(inter =>
+          inter.classes && inter.classes.includes('steps')
+        )
+      )
+    );
+  }
+
+  // 6. Helper: check if a route has any segment steeper than maxSlope
+  async function routeIsTooSteep(route) {
+    // Add null check
+    if (!route || !route.legs) {
+        return false;
+    }
+    
+        const coords = route.geometry.coordinates;
+        const steepSegments = [];
+        
+        for (let i = 0; i < coords.length - 1; i++) {
+            const [lng1, lat1] = coords[i];
+            const [lng2, lat2] = coords[i + 1];
+            const elev1 = await map.queryTerrainElevation([lng1, lat1]) || 0;
+            const elev2 = await map.queryTerrainElevation([lng2, lat2]) || 0;
+            const dist = turf.distance([lng1, lat1], [lng2, lat2], { units: 'kilometers' }) * 1000; // m
+            
+            if (dist > 0) {
+                const slope = Math.abs(elev2 - elev1) / dist;
+                if (slope > maxSlope) {
+                    steepSegments.push({
+                        start: [lng1, lat1],
+                        end: [lng2, lat2],
+                        slope: slope * 100
+                    });
+                }
+            }
+        }
+        
+        return steepSegments.length > 0 ? steepSegments : false;
+    }
+
+  // 7. On each new set of routes, pick one that avoids stairs & steep slopes
+  directions.on('route', async (e) => {
+    const routes = e.route;
+    if (!routes.length) return;
+
+    const avoidStairs = document.getElementById('avoidStairs').checked;
+    const avoidSlopes = document.getElementById('avoidSlopes').checked;
+    const maxSlope = document.getElementById('maxSlope').value / 100;
+
+    // Try each route until we find one that matches our criteria
+    for (let route of routes) {
+        let isValid = true;
+
+        if (avoidStairs && routeHasStairs(route)) {
+            console.log('Route rejected: Contains stairs');
+            isValid = false;
+            continue;
+        }
+
+        if (avoidSlopes) {
+            const steepSegments = await routeIsTooSteep(route, maxSlope);
+            if (steepSegments) {
+                console.log('Route rejected: Contains slopes steeper than ' + (maxSlope * 100) + '%');
+                // Optionally highlight steep segments on the map
+                steepSegments.forEach(segment => {
+                    map.addLayer({
+                        id: 'steep-segment-' + Math.random(),
+                        type: 'line',
+                        source: {
+                            type: 'geojson',
+                            data: {
+                                type: 'Feature',
+                                properties: {},
+                                geometry: {
+                                    type: 'LineString',
+                                    coordinates: [segment.start, segment.end]
+                                }
+                            }
+                        },
+                        paint: {
+                            'line-color': '#ff0000',
+                            'line-width': 4
+                        }
+                    });
+                });
+                isValid = false;
+                continue;
+            }
+        }
+
+        if (isValid) {
+            directions.setRoute(route);
+            break;
+        }
+    }
+  });
+
+  // Add an event listener to handle slope changes
+  document.getElementById('maxSlope').addEventListener('input', function(e) {
+      const maxSlope = parseFloat(e.target.value);
+      if (map.getLayer('SidewalksZ_FeaturesToJSON-047u9d')) {
+          map.setFilter('SidewalksZ_FeaturesToJSON-047u9d', [
+              'all',
+              ['<=', ['get', 'Grade'], maxSlope]
+          ]);
+      }
+  });
+
+  map.querySourceFeatures('sidewalks-source').forEach(feature => {
+    console.log('Grade value:', feature.properties.Grade);
+});
+
+  map.on('load', () => {
+    // Add source and layer with correct names
+    map.addSource('sidewalks-source', {
+        type: 'vector',
+        url: 'mapbox://cjaros61.2g285ux4'
+    });
+
+    map.addLayer({
+        'id': 'SidewalksZ_FeaturesToJSON-047u9d', // Match exact layer ID
+        'type': 'line',
+        'source': 'sidewalks-source',
+        'source-layer': 'SidewalksZ_FeaturesToJSON-047u9d',
+        'paint': {
+            'line-color': '#FF69B4',
+            'line-width': 2
+        }
+    });
+});
+  </script>
+</body>
+</html>
